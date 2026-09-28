@@ -2,7 +2,7 @@ import { createServer } from 'http';
 import { existsSync, readFileSync, statSync } from 'fs';
 import { extname, join } from 'path';
 import { WebSocket, WebSocketServer } from 'ws';
-import { ClientMsg, H, ItemState, MonsterState, PlayerState, SHOP_TIME, Snapshot, TICK, Upgrades, UpgradeKey, W, Wall, ZONE } from './shared';
+import { ClientMsg, H, ItemKind, ItemState, MonsterKind, MonsterState, PingState, PlayerState, RoundStats, SHOP_TIME, Snapshot, TICK, Upgrades, UpgradeKey, W, Wall, ZONE } from './shared';
 
 const PUBLIC = join(__dirname, '..', 'public');
 const PLAYER_R = 16, ITEM_R = 10, BOAT_R = 32, MONSTER_R = 22, MAX_PLAYERS = 6;
@@ -22,9 +22,29 @@ const GRAVITY = 1400, HOLD_HEIGHT = 34, ITEM_BOUNCE = 0.32, ITEM_LAND_SETTLE = 7
 // Heavier items (higher max value) are harder to carry fast and don't throw as far.
 const WEIGHT_REF = 500;
 
-interface Player extends PlayerState { ws: WebSocket; dx: number; dy: number; ax: number; ay: number; vx: number; vy: number }
+interface Player extends PlayerState {
+  ws: WebSocket;
+  dx: number;
+  dy: number;
+  ax: number;
+  ay: number;
+  vx: number;
+  vy: number;
+  stepTimer: number;
+}
 interface Item extends ItemState { vx: number; vy: number; vz: number }
-interface Monster { kind: 'hunter' | 'screamer'; x: number; y: number; vx: number; vy: number; tx: number; ty: number; active: boolean; timer: number }
+interface Monster {
+  kind: MonsterKind;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  tx: number;
+  ty: number;
+  active: boolean;
+  timer: number;
+  state?: 'idle' | 'hunting' | 'stalking' | 'fleeing';
+}
 
 const rand = (a: number, b: number) => a + Math.random() * (b - a);
 const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
@@ -35,8 +55,11 @@ const moveToward = (cur: number, target: number, maxDelta: number) => {
   const d = target - cur;
   return Math.abs(d) <= maxDelta ? target : cur + Math.sign(d) * maxDelta;
 };
-const UPGRADE_KEYS: UpgradeKey[] = ['speed', 'hp', 'grab', 'throw'];
-const cost = (key: UpgradeKey, count: number) => Math.round((key === 'speed' ? 150 : key === 'hp' ? 150 : key === 'grab' ? 100 : 120) * Math.pow(1.55, count));
+const UPGRADE_KEYS: UpgradeKey[] = ['speed', 'hp', 'grab', 'throw', 'stamina', 'scanner'];
+const cost = (key: UpgradeKey, count: number) => {
+  const base = key === 'speed' ? 150 : key === 'hp' ? 150 : key === 'grab' ? 100 : key === 'throw' ? 120 : key === 'stamina' ? 130 : 200;
+  return Math.round(base * Math.pow(1.5, count));
+};
 
 function overlapsZone(x: number, y: number, w: number, h: number, pad = 40) {
   return x < ZONE.x + ZONE.w + pad && x + w > ZONE.x - pad && y < ZONE.y + ZONE.h + pad && y + h > ZONE.y - pad;
@@ -70,6 +93,21 @@ function canSee(ax: number, ay: number, bx: number, by: number, walls: Wall[]) {
   }
   return true;
 }
+
+// Smarter obstacle steering: probe radial angles so monsters steer around corners without getting stuck
+function findClearDirection(x: number, y: number, wantAngle: number, r: number, walls: Wall[]): { dx: number; dy: number } {
+  const angles = [0, 0.45, -0.45, 0.9, -0.9, 1.4, -1.4, 2.0, -2.0];
+  for (const da of angles) {
+    const a = wantAngle + da;
+    const testX = x + Math.cos(a) * (r + 14);
+    const testY = y + Math.sin(a) * (r + 14);
+    if (!pointBlocked(testX, testY, r, walls)) {
+      return { dx: Math.cos(a), dy: Math.sin(a) };
+    }
+  }
+  return { dx: Math.cos(wantAngle), dy: Math.sin(wantAngle) };
+}
+
 function randomFreeSpot(walls: Wall[], r: number, avoidZone: boolean) {
   for (let i = 0; i < 40; i++) {
     const x = rand(80, W - 80), y = rand(60, H - 60);
@@ -84,13 +122,16 @@ class Room {
   items: Item[] = [];
   monsters: Monster[] = [];
   walls: Wall[] = [];
-  level = 1; banked = 0; quota = 0; credits = 0; nextId = 1; resetAt = 0;
-  upgrades: Upgrades = { speed: 0, hp: 0, grab: 0, throw: 0 };
+  pings: PingState[] = [];
+  stats: RoundStats = { itemsHauled: 0, totalBanked: 0, revives: 0 };
+  level = 1; banked = 0; quota = 0; credits = 0; nextId = 1; nextPingId = 1; resetAt = 0;
+  upgrades: Upgrades = { speed: 0, hp: 0, grab: 0, throw: 0, stamina: 0, scanner: 0 };
   status: Snapshot['status'] = 'playing';
 
   constructor(public code: string) { this.startLevel(); }
 
   get maxHp() { return BASE_HP + this.upgrades.hp * 20; }
+  get maxStamina() { return 100 + this.upgrades.stamina * 25; }
   get walkSpeed() { return BASE_WALK * (1 + this.upgrades.speed * 0.08); }
   get carrySpeed() { return BASE_CARRY * (1 + this.upgrades.speed * 0.08); }
   get grabRange() { return BASE_GRAB + this.upgrades.grab * 12; }
@@ -111,7 +152,14 @@ class Room {
 
   add(ws: WebSocket, name: string): Player {
     const id = Math.random().toString(36).slice(2, 7);
-    const p: Player = { id, name, x: 0, y: 0, hp: this.maxHp, maxHp: this.maxHp, holding: null, dead: false, reviveProg: 0, ws, dx: 0, dy: 0, ax: 0, ay: 0, vx: 0, vy: 0 };
+    const p: Player = {
+      id, name, x: 0, y: 0,
+      hp: this.maxHp, maxHp: this.maxHp,
+      stamina: this.maxStamina, maxStamina: this.maxStamina,
+      sprinting: false, flashlight: true,
+      holding: null, dead: false, reviveProg: 0,
+      ws, dx: 0, dy: 0, ax: 0, ay: 0, vx: 0, vy: 0, stepTimer: 0
+    };
     this.spawn(p);
     this.players.set(id, p);
     return p;
@@ -122,7 +170,22 @@ class Room {
   spawn(p: Player) {
     p.x = ZONE.x + ZONE.w / 2 + rand(-60, 60);
     p.y = ZONE.y + ZONE.h / 2 + rand(-60, 60);
-    p.maxHp = this.maxHp; p.hp = this.maxHp; p.dead = false; p.holding = null; p.vx = 0; p.vy = 0; p.reviveProg = 0;
+    p.maxHp = this.maxHp; p.hp = this.maxHp;
+    p.maxStamina = this.maxStamina; p.stamina = this.maxStamina;
+    p.sprinting = false; p.flashlight = true;
+    p.dead = false; p.holding = null; p.vx = 0; p.vy = 0; p.reviveProg = 0;
+  }
+
+  addPing(x: number, y: number, kind: 'scrap' | 'danger' | 'info', creator: string) {
+    if (this.pings.length > 12) this.pings.shift();
+    this.pings.push({
+      id: this.nextPingId++,
+      x: clamp(x, 0, W),
+      y: clamp(y, 0, H),
+      kind,
+      creator,
+      ttl: 6
+    });
   }
 
   generateWalls() {
@@ -141,22 +204,60 @@ class Room {
     this.quota = 800 + this.level * 400; this.banked = 0; this.status = 'playing';
     this.walls = this.generateWalls();
     this.items = [];
-    const itemCount = Math.round((8 + this.level * 2) * AREA_SCALE);
+    this.pings = [];
+    this.stats = { itemsHauled: 0, totalBanked: 0, revives: 0 };
+    const itemCount = Math.round((9 + this.level * 2) * AREA_SCALE);
+
+    const itemPool: Array<{ kind: ItemKind; minVal: number; maxVal: number; r: number }> = [
+      { kind: 'battery', minVal: 160, maxVal: 260, r: 10 },
+      { kind: 'canister', minVal: 260, maxVal: 420, r: 12 },
+      { kind: 'crate', minVal: 380, maxVal: 620, r: 14 },
+      { kind: 'relic', minVal: 600, maxVal: 950, r: 11 },
+    ];
+    if (this.level >= 2) {
+      itemPool.push({ kind: 'engine', minVal: 850, maxVal: 1300, r: 18 });
+    }
+
     for (let i = 0; i < itemCount; i++) {
-      const max = Math.round(rand(150, 450));
-      const spot = randomFreeSpot(this.walls, ITEM_R, false);
-      this.items.push({ id: this.nextId++, x: spot.x, y: spot.y, z: 0, vx: 0, vy: 0, vz: 0, value: max, max, held: null, r: ITEM_R, big: false });
+      const typeDef = itemPool[Math.floor(Math.random() * itemPool.length)];
+      const max = Math.round(rand(typeDef.minVal, typeDef.maxVal) * (1 + (this.level - 1) * 0.08));
+      const spot = randomFreeSpot(this.walls, typeDef.r, false);
+      this.items.push({
+        id: this.nextId++,
+        x: spot.x, y: spot.y, z: 0,
+        vx: 0, vy: 0, vz: 0,
+        value: max, max, held: null,
+        r: typeDef.r, big: false,
+        kind: typeDef.kind
+      });
     }
-    // One heavy boat per level: worth a lot, but too heavy to haul solo — a
-    // second player standing near it while it's held brings it back to a
-    // normal carry speed.
+
+    // Heavy boat
     {
-      const max = Math.round(1200 + this.level * 250);
+      const max = Math.round(1400 + this.level * 280);
       const spot = randomFreeSpot(this.walls, BOAT_R, false);
-      this.items.push({ id: this.nextId++, x: spot.x, y: spot.y, z: 0, vx: 0, vy: 0, vz: 0, value: max, max, held: null, r: BOAT_R, big: true });
+      this.items.push({
+        id: this.nextId++,
+        x: spot.x, y: spot.y, z: 0,
+        vx: 0, vy: 0, vz: 0,
+        value: max, max, held: null,
+        r: BOAT_R, big: true,
+        kind: 'boat'
+      });
     }
-    this.monsters = [{ kind: 'hunter', ...randomFreeSpot(this.walls, MONSTER_R, true), vx: 0, vy: 0, tx: W / 2, ty: H / 2, active: false, timer: 0 }];
-    if (this.level >= 2) this.monsters.push({ kind: 'screamer', ...randomFreeSpot(this.walls, MONSTER_R, true), vx: 0, vy: 0, tx: 0, ty: 0, active: false, timer: 0 });
+
+    this.monsters = [
+      { kind: 'hunter', ...randomFreeSpot(this.walls, MONSTER_R, true), vx: 0, vy: 0, tx: W / 2, ty: H / 2, active: false, timer: 0, state: 'idle' }
+    ];
+    if (this.level >= 2) {
+      this.monsters.push({ kind: 'screamer', ...randomFreeSpot(this.walls, MONSTER_R, true), vx: 0, vy: 0, tx: 0, ty: 0, active: false, timer: 0, state: 'idle' });
+    }
+    if (this.level >= 3) {
+      this.monsters.push({ kind: 'stalker', ...randomFreeSpot(this.walls, MONSTER_R, true), vx: 0, vy: 0, tx: 0, ty: 0, active: false, timer: 0, state: 'idle' });
+    }
+    if (this.level >= 5) {
+      this.monsters.push({ kind: 'hunter', ...randomFreeSpot(this.walls, MONSTER_R, true), vx: 0, vy: 0, tx: W / 3, ty: H / 3, active: false, timer: 0, state: 'idle' });
+    }
     this.players.forEach(p => this.spawn(p));
   }
 
@@ -193,6 +294,7 @@ class Room {
     if (this.credits < c) return;
     this.credits -= c; this.upgrades[item]++;
     if (item === 'hp') for (const p of this.players.values()) { p.maxHp = this.maxHp; p.hp = Math.min(p.maxHp, p.hp + 20); }
+    if (item === 'stamina') for (const p of this.players.values()) { p.maxStamina = this.maxStamina; p.stamina = this.maxStamina; }
   }
 
   // Loud impacts pull the hunter's patrol point and can wake a screamer.
@@ -200,6 +302,7 @@ class Room {
     for (const m of this.monsters) {
       if (m.kind === 'hunter' && !m.active && dist(x, y, m.x, m.y) < loud * 1.5) { m.tx = x; m.ty = y; }
       if (m.kind === 'screamer' && dist(x, y, m.x, m.y) < SCREAM_RANGE) { m.active = true; m.timer = 4; m.tx = x; m.ty = y; }
+      if (m.kind === 'stalker' && dist(x, y, m.x, m.y) < loud * 1.2) { m.tx = x; m.ty = y; }
     }
   }
 
@@ -249,7 +352,10 @@ class Room {
       }
 
       if (!it.held && it.z <= 1 && it.x > ZONE.x && it.x < ZONE.x + ZONE.w && it.y > ZONE.y && it.y < ZONE.y + ZONE.h) {
-        this.banked += Math.round(it.value);
+        const val = Math.round(it.value);
+        this.banked += val;
+        this.stats.itemsHauled++;
+        this.stats.totalBanked += val;
         it.id = -1; // marked for removal
       }
     }
@@ -259,33 +365,104 @@ class Room {
   updateMonsters(dt: number) {
     for (const m of this.monsters) {
       let chasing = false;
+      let sp = 80;
+
       if (m.kind === 'hunter') {
         let target: Player | undefined, best = DETECT;
         for (const p of this.players.values()) {
           const d = dist(p.x, p.y, m.x, m.y);
           if (!p.dead && d < best && canSee(m.x, m.y, p.x, p.y, this.walls)) { best = d; target = p; }
         }
-        if (target) { chasing = true; m.active = true; m.timer = 2; m.tx = target.x; m.ty = target.y; }
-        else if (m.active && (m.timer -= dt) > 0) chasing = true;
-        else m.active = false;
-      } else {
-        for (const p of this.players.values()) if (!p.dead && dist(p.x, p.y, m.x, m.y) < 140) { m.tx = p.x; m.ty = p.y; m.active = true; m.timer = 3; }
-        if (m.active) { chasing = true; m.timer -= dt; if (m.timer <= 0) m.active = false; }
+        if (target) {
+          chasing = true; m.active = true; m.timer = 2; m.tx = target.x; m.ty = target.y;
+          m.state = 'hunting';
+        } else if (m.active && (m.timer -= dt) > 0) {
+          chasing = true;
+          m.state = 'hunting';
+        } else {
+          m.active = false;
+          m.state = 'idle';
+        }
+        sp = chasing ? Math.min(210, 160 + this.level * 12) : 80;
+      } else if (m.kind === 'screamer') {
+        for (const p of this.players.values()) if (!p.dead && dist(p.x, p.y, m.x, m.y) < 140) {
+          m.tx = p.x; m.ty = p.y; m.active = true; m.timer = 3.5;
+        }
+        if (m.active) {
+          chasing = true; m.timer -= dt; if (m.timer <= 0) m.active = false;
+          m.state = 'hunting';
+        } else {
+          m.state = 'idle';
+        }
+        sp = chasing ? 250 : 35;
+      } else if (m.kind === 'stalker') {
+        // Find closest living player
+        let closest: Player | undefined, minDist = 99999;
+        for (const p of this.players.values()) {
+          if (p.dead) continue;
+          const d = dist(p.x, p.y, m.x, m.y);
+          if (d < minDist) { minDist = d; closest = p; }
+        }
+
+        if (closest) {
+          // Check if player is shining flashlight directly at stalker
+          const toStalkerAngle = Math.atan2(m.y - closest.y, m.x - closest.x);
+          const pAngle = Math.atan2(closest.ay - closest.y, closest.ax - closest.x);
+          let angleDiff = Math.abs(toStalkerAngle - pAngle);
+          while (angleDiff > Math.PI) angleDiff = Math.abs(angleDiff - Math.PI * 2);
+
+          const isSpotted = closest.flashlight && angleDiff < 0.85 && minDist < 500 && canSee(closest.x, closest.y, m.x, m.y, this.walls);
+
+          if (isSpotted) {
+            // Spotted! Retreat into shadow
+            m.state = 'fleeing';
+            m.active = true;
+            chasing = false;
+            m.tx = m.x + Math.cos(toStalkerAngle) * 220;
+            m.ty = m.y + Math.sin(toStalkerAngle) * 220;
+            sp = 190;
+          } else if (minDist < 90) {
+            // Lunging attack range!
+            m.state = 'hunting';
+            m.active = true;
+            chasing = true;
+            m.tx = closest.x; m.ty = closest.y;
+            sp = 220;
+          } else {
+            // Stealthily creep closer behind player
+            m.state = 'stalking';
+            m.active = false;
+            chasing = true;
+            m.tx = closest.x; m.ty = closest.y;
+            sp = 145;
+          }
+        } else {
+          m.state = 'idle';
+          sp = 60;
+        }
       }
 
       const d = dist(m.tx, m.ty, m.x, m.y);
-      if (d < 20 && !chasing) { m.tx = rand(60, W - 60); m.ty = rand(60, H - 60); }
-      const sp = chasing ? (m.kind === 'screamer' ? 240 : Math.min(200, 150 + this.level * 15)) : (m.kind === 'screamer' ? 40 : 80);
-      const wantX = d > 1 ? (m.tx - m.x) / d * sp : 0, wantY = d > 1 ? (m.ty - m.y) / d * sp : 0;
+      if (d < 24 && !chasing && m.state !== 'fleeing') {
+        m.tx = rand(60, W - 60); m.ty = rand(60, H - 60);
+      }
+
+      const wantAngle = Math.atan2(m.ty - m.y, m.tx - m.x);
+      // Smart navigation around walls
+      const steer = findClearDirection(m.x, m.y, wantAngle, MONSTER_R, this.walls);
+      const wantX = d > 1 ? steer.dx * sp : 0;
+      const wantY = d > 1 ? steer.dy * sp : 0;
+
       const accel = MONSTER_ACCEL * dt;
       m.vx = moveToward(m.vx, wantX, accel); m.vy = moveToward(m.vy, wantY, accel);
       const r = resolveWalls(m.x + m.vx * dt, m.y + m.vy * dt, MONSTER_R, this.walls);
-      if (r.x === m.x) m.vx = 0; if (r.y === m.y) m.vy = 0; // wall stopped that axis — kill the momentum into it
+      if (r.x === m.x) m.vx = 0; if (r.y === m.y) m.vy = 0;
       m.x = r.x; m.y = r.y;
 
       for (const p of this.players.values()) {
         if (!p.dead && dist(p.x, p.y, m.x, m.y) < PLAYER_R + MONSTER_R) {
-          p.hp -= 40 * dt;
+          const dmg = m.kind === 'stalker' ? 50 : 40;
+          p.hp -= dmg * dt;
           if (p.hp <= 0) { p.hp = 0; p.dead = true; this.release(p); }
         }
       }
@@ -300,7 +477,12 @@ class Room {
       const helper = [...this.players.values()].some(o => o !== p && !o.dead && dist(o.x, o.y, p.x, p.y) < REVIVE_RANGE);
       if (helper) {
         p.reviveProg += dt / REVIVE_TIME;
-        if (p.reviveProg >= 1) { p.dead = false; p.reviveProg = 0; p.hp = Math.round(p.maxHp * 0.4); }
+        if (p.reviveProg >= 1) {
+          p.dead = false;
+          p.reviveProg = 0;
+          p.hp = Math.round(p.maxHp * 0.4);
+          this.stats.revives++;
+        }
       } else {
         p.reviveProg = Math.max(0, p.reviveProg - dt / REVIVE_TIME); // drains if left alone
       }
@@ -313,20 +495,51 @@ class Room {
       return;
     }
     if (this.status !== 'playing') {
-      if (Date.now() > this.resetAt) { this.level = 1; this.credits = 0; this.upgrades = { speed: 0, hp: 0, grab: 0, throw: 0 }; this.startLevel(); }
+      if (Date.now() > this.resetAt) {
+        this.level = 1; this.credits = 0;
+        this.upgrades = { speed: 0, hp: 0, grab: 0, throw: 0, stamina: 0, scanner: 0 };
+        this.startLevel();
+      }
       return;
     }
+
+    // Update pings
+    for (const ping of this.pings) {
+      ping.ttl -= dt;
+    }
+    this.pings = this.pings.filter(p => p.ttl > 0);
+
     for (const p of this.players.values()) {
       if (p.dead) continue;
       const len = Math.hypot(p.dx, p.dy);
-      let maxSpd = this.walkSpeed;
+      const isMoving = len > 0;
+
+      // Sprinting and stamina
+      let sprintMult = 1.0;
+      if (p.sprinting && isMoving && p.stamina > 0) {
+        p.stamina = Math.max(0, p.stamina - 28 * dt);
+        sprintMult = 1.45;
+        // Sprinting footsteps noise attracts nearby monsters
+        p.stepTimer = (p.stepTimer || 0) + dt;
+        if (p.stepTimer > 0.35) {
+          p.stepTimer = 0;
+          this.noise(p.x, p.y, 175);
+        }
+      } else {
+        if (!p.sprinting) {
+          p.stamina = Math.min(p.maxStamina, p.stamina + 22 * dt);
+        }
+      }
+
+      let maxSpd = this.walkSpeed * sprintMult;
       if (p.holding !== null) {
         const held = this.items.find(i => i.id === p.holding);
-        maxSpd = this.carrySpeedFor(held ? this.effectiveWeight(held) : 0);
+        maxSpd = this.carrySpeedFor(held ? this.effectiveWeight(held) : 0) * (p.sprinting && p.stamina > 0 ? 1.3 : 1.0);
       }
-      const wantX = len > 0 ? (p.dx / len) * maxSpd : 0, wantY = len > 0 ? (p.dy / len) * maxSpd : 0;
+      const wantX = isMoving ? (p.dx / len) * maxSpd : 0;
+      const wantY = isMoving ? (p.dy / len) * maxSpd : 0;
       // Braking (no input) pulls up quicker than accelerating does, so stops feel snappy but starts still ramp up.
-      const accel = (len > 0 ? PLAYER_ACCEL : PLAYER_BRAKE) * dt;
+      const accel = (isMoving ? PLAYER_ACCEL : PLAYER_BRAKE) * dt;
       p.vx = moveToward(p.vx, wantX, accel); p.vy = moveToward(p.vy, wantY, accel);
       if (p.vx === 0 && p.vy === 0) continue;
       const r = resolveWalls(p.x + p.vx * dt, p.y + p.vy * dt, PLAYER_R, this.walls);
@@ -348,13 +561,21 @@ class Room {
   broadcast() {
     const snap: Snapshot = {
       t: 'state',
-      players: [...this.players.values()].map(({ id, name, x, y, hp, maxHp, holding, dead, reviveProg }) => ({ id, name, x, y, hp, maxHp, holding, dead, reviveProg })),
-      items: this.items.map(({ id, x, y, z, value, max, held, r, big }) => ({ id, x, y, z: Math.round(z), value: Math.round(value), max, held, r, big })),
-      monsters: this.monsters.map(({ kind, x, y, active }): MonsterState => ({ kind, x, y, active })),
+      players: [...this.players.values()].map(({ id, name, x, y, hp, maxHp, stamina, maxStamina, sprinting, flashlight, holding, dead, reviveProg }) => ({
+        id, name, x, y, hp, maxHp, stamina: Math.round(stamina), maxStamina, sprinting, flashlight, holding, dead, reviveProg
+      })),
+      items: this.items.map(({ id, x, y, z, value, max, held, r, big, kind }) => ({
+        id, x, y, z: Math.round(z), value: Math.round(value), max, held, r, big, kind
+      })),
+      monsters: this.monsters.map(({ kind, x, y, active, state }): MonsterState => ({
+        kind, x, y, active, state
+      })),
       walls: this.walls,
+      pings: this.pings,
       banked: this.banked, quota: this.quota, level: this.level, credits: this.credits, upgrades: this.upgrades,
       shopTimeLeft: this.status === 'shop' ? Math.max(0, Math.ceil((this.resetAt - Date.now()) / 1000)) : 0,
       status: this.status,
+      stats: this.stats,
     };
     const data = JSON.stringify(snap);
     for (const p of this.players.values()) if (p.ws.readyState === WebSocket.OPEN) p.ws.send(data);
@@ -411,9 +632,12 @@ wss.on('connection', ws => {
       const n = (v: unknown, lo: number, hi: number) => clamp(Number.isFinite(v) ? (v as number) : 0, lo, hi);
       player.dx = n(m.dx, -1, 1); player.dy = n(m.dy, -1, 1);
       player.ax = n(m.ax, 0, W); player.ay = n(m.ay, 0, H);
+      if (typeof m.sprint === 'boolean') player.sprinting = m.sprint;
     } else if (m.t === 'grab') room.grab(player);
     else if (m.t === 'throw') room.throwItem(player);
     else if (m.t === 'buy' && UPGRADE_KEYS.includes(m.item)) room.buy(m.item);
+    else if (m.t === 'flashlight') player.flashlight = !!m.on;
+    else if (m.t === 'ping') room.addPing(m.x, m.y, m.kind || 'info', player.name);
   });
 
   ws.on('close', () => {
